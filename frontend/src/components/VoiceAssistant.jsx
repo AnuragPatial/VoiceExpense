@@ -3,6 +3,163 @@ import Vapi from '@vapi-ai/web';
 import { Mic, MicOff, AlertCircle, Volume2, Sparkles, Settings, RefreshCw } from 'lucide-react';
 import StatusIndicator from './StatusIndicator';
 
+const SYSTEM_PROMPT = `You are VoiceExpense, a helpful voice-first personal expense tracking assistant.
+Your job is to help the user record, query, summarize, and delete their personal expenses.
+
+Always use the provided tools whenever the user asks to add, view, summarize, or delete expenses:
+1. addExpense: Call when the user mentions spending money (e.g. "Add 450 rupees for dinner", "I spent 200 on coffee"). Extract amount (number), category (Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Education, Other), description, and expense_date (YYYY-MM-DD, "today", or "yesterday").
+2. getExpenses: Call when the user asks to see recent expenses or filter expenses by category/date.
+3. getExpenseSummary: Call when the user asks how much they spent in total, this month, or on a specific category.
+4. deleteExpense: Call when the user asks to delete their last expense (pass id: "last") or a specific expense ID.
+
+Keep your spoken responses concise, natural, and conversational.
+After recording an expense, confirm the amount, description, and category (for example: "Done. I recorded ₹450 for dinner under Food.").`;
+
+function getToolDefinitions(serverUrl) {
+  const serverBlock = serverUrl ? { server: { url: serverUrl } } : {};
+
+  return [
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'addExpense',
+        description: 'Record a new personal expense with amount, category, description, and date.',
+        parameters: {
+          type: 'object',
+          properties: {
+            amount: { type: 'number', description: 'The expense amount in rupees (must be greater than 0).' },
+            category: { type: 'string', description: 'Category: Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Education, or Other.' },
+            description: { type: 'string', description: 'Short description of the expense, e.g., Dinner, Uber ride, Coffee.' },
+            expense_date: { type: 'string', description: 'Date of the expense (today, yesterday, or YYYY-MM-DD).' }
+          },
+          required: ['amount', 'description']
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'getExpenses',
+        description: 'Retrieve recent expenses, optionally filtered by category or date range.',
+        parameters: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', description: 'Optional category to filter by.' },
+            limit: { type: 'number', description: 'Maximum number of recent expenses to return (default 5).' },
+            from: { type: 'string', description: 'Optional start date (YYYY-MM-DD).' },
+            to: { type: 'string', description: 'Optional end date (YYYY-MM-DD).' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'getExpenseSummary',
+        description: 'Calculate total spending and category breakdown, optionally filtered by category or date range.',
+        parameters: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', description: 'Optional category to summarize.' },
+            from: { type: 'string', description: 'Optional start date (YYYY-MM-DD).' },
+            to: { type: 'string', description: 'Optional end date (YYYY-MM-DD).' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'deleteExpense',
+        description: 'Delete an expense by ID, or pass "last" to delete the most recently added expense.',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'The ID of the expense to delete, or "last" for the latest expense.' }
+          },
+          required: ['id']
+        }
+      }
+    }
+  ];
+}
+
+function getPublicWebhookUrl() {
+  if (typeof window === 'undefined') return undefined;
+  const origin = window.location.origin;
+  if (origin.startsWith('https://') && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+    return `${origin}/api/vapi/tool`;
+  }
+  return undefined;
+}
+
+function buildInlineAssistant(serverUrl) {
+  const assistant = {
+    name: 'VoiceExpense Assistant',
+    firstMessage: 'Hi! I am VoiceExpense. Tell me what you spent, or ask for your spending summary.',
+    transcriber: {
+      provider: 'deepgram',
+      model: 'nova-2',
+      language: 'en'
+    },
+    model: {
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: SYSTEM_PROMPT }],
+      tools: getToolDefinitions(serverUrl)
+    },
+    clientMessages: [
+      'transcript',
+      'hang',
+      'function-call',
+      'speech-update',
+      'metadata',
+      'conversation-update',
+      'tool-calls',
+      'tool-calls-result',
+      'tool.completed'
+    ]
+  };
+
+  if (serverUrl) {
+    assistant.serverUrl = serverUrl;
+    assistant.server = { url: serverUrl };
+  }
+
+  return assistant;
+}
+
+function extractVapiErrorMessage(err) {
+  if (!err) return 'An unknown error occurred during the voice session.';
+  if (typeof err === 'string') return err;
+
+  const nestedMsg =
+    err?.error?.error?.message ||
+    err?.error?.message ||
+    err?.error?.errorMsg ||
+    err?.error?.errorDetail ||
+    err?.errorMsg ||
+    err?.message;
+
+  if (typeof nestedMsg === 'string' && nestedMsg.trim()) {
+    return nestedMsg;
+  }
+
+  if (Array.isArray(nestedMsg)) {
+    return nestedMsg.join(', ');
+  }
+
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return 'Voice assistant connection error.';
+  }
+}
+
 export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig }) => {
   const [status, setStatus] = useState('disconnected');
   const [transcripts, setTranscripts] = useState([]);
@@ -11,7 +168,14 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
   const [activeSpeechRole, setActiveSpeechRole] = useState(null);
 
   const vapiRef = useRef(null);
+  const activeKeyRef = useRef('');
+  const processedToolCallIdsRef = useRef(new Set());
   const transcriptEndRef = useRef(null);
+  const onExpenseMutatedRef = useRef(onExpenseMutated);
+
+  useEffect(() => {
+    onExpenseMutatedRef.current = onExpenseMutated;
+  }, [onExpenseMutated]);
 
   useEffect(() => {
     if (transcriptEndRef.current) {
@@ -29,12 +193,35 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
     };
   }, []);
 
-  const getVapiInstance = () => {
-    const key = vapiConfig.publicKey || import.meta.env.VITE_VAPI_PUBLIC_KEY || '';
+  const forwardToolCallToBackend = async (messagePayload) => {
+    try {
+      const res = await fetch('/api/vapi/tool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: messagePayload })
+      });
+      if (res.ok) {
+        onExpenseMutatedRef.current();
+      }
+    } catch (e) {
+      console.warn('Client-side tool bridge error:', e);
+    }
+  };
+
+  const getVapiInstance = (rawPublicKey) => {
+    const key = (rawPublicKey || '').trim();
     if (!key) return null;
+
+    if (vapiRef.current && activeKeyRef.current !== key) {
+      try {
+        vapiRef.current.stop();
+      } catch (e) {}
+      vapiRef.current = null;
+    }
 
     if (!vapiRef.current) {
       const vapi = new Vapi(key);
+      activeKeyRef.current = key;
 
       vapi.on('call-start', () => {
         setStatus('connected');
@@ -45,7 +232,7 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
         setStatus('disconnected');
         setActiveSpeechRole(null);
         setVolumeLevel(0);
-        onExpenseMutated();
+        onExpenseMutatedRef.current();
       });
 
       vapi.on('speech-start', () => {
@@ -62,6 +249,8 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
       });
 
       vapi.on('message', (message) => {
+        if (!message) return;
+
         if (message.type === 'transcript') {
           const role = message.role === 'user' ? 'user' : 'assistant';
           const text = message.transcript || message.text || '';
@@ -96,19 +285,42 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
           }
         }
 
-        if (
-          message.type === 'tool-calls' ||
-          message.type === 'function-call' ||
-          message.type === 'tool-call-result'
+        if (message.type === 'tool-calls' || message.type === 'function-call') {
+          const calls = message.toolCalls || message.toolCallList || (message.functionCall ? [message.functionCall] : []);
+          let hasNewCall = false;
+          for (const c of calls) {
+            const id = c?.id || `${c?.name || c?.function?.name}-${JSON.stringify(c?.arguments || c?.parameters || {})}`;
+            if (!processedToolCallIdsRef.current.has(id)) {
+              processedToolCallIdsRef.current.add(id);
+              hasNewCall = true;
+            }
+          }
+          if (hasNewCall) {
+            forwardToolCallToBackend(message);
+          } else {
+            onExpenseMutatedRef.current();
+          }
+        } else if (
+          message.type === 'tool-call-result' ||
+          message.type === 'tool-calls-result' ||
+          message.type === 'tool.completed'
         ) {
-          onExpenseMutated();
+          onExpenseMutatedRef.current();
         }
       });
 
       vapi.on('error', (err) => {
+        if (
+          err?.type === 'audio-processing-setup-error' ||
+          err?.type === 'audio-processor-recovery-error' ||
+          err?.type === 'local-audio-level-observer-error'
+        ) {
+          return;
+        }
+
         console.error('Vapi error:', err);
-        const errMsg = err?.message || err?.errorMsg || 'Voice session error';
-        if (errMsg.includes('Permission') || errMsg.includes('NotAllowedError')) {
+        const errMsg = extractVapiErrorMessage(err);
+        if (/permission|notallowederror|microphone/i.test(errMsg)) {
           setErrorMessage('Microphone permission is required.');
         } else {
           setErrorMessage(errMsg);
@@ -126,37 +338,68 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
 
     if (status !== 'disconnected') {
       try {
-        if (vapiRef.current) vapiRef.current.stop();
+        if (vapiRef.current) await vapiRef.current.stop();
       } catch (e) {}
       setStatus('disconnected');
       return;
     }
 
-    const publicKey = vapiConfig.publicKey || import.meta.env.VITE_VAPI_PUBLIC_KEY;
-    const assistantId = vapiConfig.assistantId || import.meta.env.VITE_VAPI_ASSISTANT_ID;
+    const publicKey = (vapiConfig.publicKey || import.meta.env.VITE_VAPI_PUBLIC_KEY || '').trim();
+    const assistantId = (vapiConfig.assistantId || import.meta.env.VITE_VAPI_ASSISTANT_ID || '').trim();
 
-    if (!publicKey || !assistantId) {
-      setErrorMessage('Vapi Public Key and Assistant ID are required to start voice interaction.');
+    if (!publicKey) {
+      setErrorMessage('Vapi Public Key is required to start voice interaction.');
       onOpenSettings();
       return;
     }
 
     try {
       setStatus('connecting');
-      const vapi = getVapiInstance();
+      const vapi = getVapiInstance(publicKey);
       if (!vapi) {
         setErrorMessage('Failed to initialize Vapi client. Please verify credentials.');
         setStatus('disconnected');
         return;
       }
-      await vapi.start(assistantId);
+
+      const serverUrl = getPublicWebhookUrl();
+      let callResult = null;
+
+      if (assistantId) {
+        const overrides = {
+          clientMessages: [
+            'transcript',
+            'hang',
+            'function-call',
+            'speech-update',
+            'metadata',
+            'conversation-update',
+            'tool-calls',
+            'tool-calls-result',
+            'tool.completed'
+          ]
+        };
+        if (serverUrl) {
+          overrides.serverUrl = serverUrl;
+          overrides.server = { url: serverUrl };
+        }
+        callResult = await vapi.start(assistantId, overrides);
+        if (!callResult) {
+          try { await vapi.stop(); } catch {}
+          setStatus('connecting');
+          setErrorMessage(null);
+          callResult = await vapi.start(buildInlineAssistant(serverUrl));
+        }
+      } else {
+        callResult = await vapi.start(buildInlineAssistant(serverUrl));
+      }
+
+      if (!callResult) {
+        setStatus('disconnected');
+      }
     } catch (err) {
       console.error('Vapi start error:', err);
-      if (err.name === 'NotAllowedError') {
-        setErrorMessage('Microphone permission is required.');
-      } else {
-        setErrorMessage(err.message || 'Unable to connect to Vapi.');
-      }
+      setErrorMessage(extractVapiErrorMessage(err));
       setStatus('disconnected');
     }
   };

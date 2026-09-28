@@ -1,6 +1,6 @@
 {
   "name": "VoiceExpense",
   "description": "Voice-powered personal expense tracker with Vapi AI, Express, and SQLite.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

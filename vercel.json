@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "includeFiles": "node_modules/sql.js/dist/sql-wasm.wasm",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

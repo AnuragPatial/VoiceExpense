@@ -1,50 +1,56 @@
 import express from 'express';
 import { query, get, run } from '../database/database.js';
-import { normalizeCategory, resolveDate, VALID_CATEGORIES } from './expenses.js';
+import { normalizeCategory, resolveDate } from './expenses.js';
 
 const router = express.Router();
+
+// Cache executed toolCallIds to prevent duplicate insertions when both Vapi server webhook and client SDK forward tool calls
+const executedToolCalls = new Map();
 
 /**
  * Executes a tool by name with arguments
  */
-export async function executeTool(name, args = {}) {
-  const toolName = (name || '').toLowerCase();
-
-  if (toolName === 'addexpense') {
-    const rawAmount = parseFloat(args.amount);
-    if (isNaN(rawAmount) || rawAmount <= 0) {
-      return {
-        error: 'Invalid amount. Please specify an amount greater than 0.'
-      };
-    }
-
-    const description = (args.description || args.title || 'Expense').toString().trim();
-    const category = normalizeCategory(args.category || description);
-    const date = resolveDate(args.expense_date || args.date);
-    const createdAt = new Date().toISOString();
-
-    const insertResult = await run(
-      `INSERT INTO expenses (amount, category, description, expense_date, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [Math.round(rawAmount * 100) / 100, category, description, date, createdAt]
-    );
-
-    const created = await get('SELECT * FROM expenses WHERE id = ?', [insertResult.lastID]);
-
-    return {
-      success: true,
-      message: `Done. I recorded ₹${created.amount} for ${created.description} under ${created.category}.`,
-      expense: created
-    };
+export async function executeTool(name, args = {}, toolCallId = null) {
+  if (toolCallId && executedToolCalls.has(toolCallId)) {
+    return executedToolCalls.get(toolCallId);
   }
 
-  if (toolName === 'getexpenses') {
+  const toolName = (name || '').toLowerCase().replace(/[_-\s]/g, '');
+  let resultOutput;
+
+  if (toolName === 'addexpense' || toolName === 'createexpense' || toolName === 'recordexpense') {
+    const rawAmount = parseFloat(args.amount);
+    if (isNaN(rawAmount) || rawAmount <= 0) {
+      resultOutput = {
+        error: 'Invalid amount. Please specify an amount greater than 0.'
+      };
+    } else {
+      const description = (args.description || args.title || args.item || args.category || 'Expense').toString().trim();
+      const category = normalizeCategory(args.category || description);
+      const date = resolveDate(args.expense_date || args.date);
+      const createdAt = new Date().toISOString();
+
+      const insertResult = await run(
+        `INSERT INTO expenses (amount, category, description, expense_date, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [Math.round(rawAmount * 100) / 100, category, description, date, createdAt]
+      );
+
+      const created = await get('SELECT * FROM expenses WHERE id = ?', [insertResult.lastID]);
+
+      resultOutput = {
+        success: true,
+        message: `Done. I recorded ₹${created.amount} for ${created.description} under ${created.category}.`,
+        expense: created
+      };
+    }
+  } else if (toolName === 'getexpenses' || toolName === 'listexpenses' || toolName === 'showexpenses') {
     let sql = 'SELECT * FROM expenses WHERE 1=1';
     const params = [];
 
-    if (args.category) {
+    if (args.category && args.category.toLowerCase() !== 'all') {
       sql += ' AND LOWER(category) = LOWER(?)';
-      params.push(args.category);
+      params.push(normalizeCategory(args.category));
     }
     if (args.from) {
       sql += ' AND expense_date >= ?';
@@ -64,32 +70,30 @@ export async function executeTool(name, args = {}) {
     const rows = await query(sql, params);
 
     if (rows.length === 0) {
-      return {
+      resultOutput = {
         success: true,
         message: 'No expenses found matching your request.',
         expenses: []
       };
+    } else {
+      const itemsSummary = rows
+        .map(r => `₹${r.amount} for ${r.description} (${r.category}) on ${r.expense_date}`)
+        .join(', ');
+
+      resultOutput = {
+        success: true,
+        message: `Here are your recent expenses: ${itemsSummary}.`,
+        count: rows.length,
+        expenses: rows
+      };
     }
-
-    const itemsSummary = rows
-      .map(r => `₹${r.amount} for ${r.description} (${r.category}) on ${r.expense_date}`)
-      .join(', ');
-
-    return {
-      success: true,
-      message: `Here are your recent expenses: ${itemsSummary}.`,
-      count: rows.length,
-      expenses: rows
-    };
-  }
-
-  if (toolName === 'getexpensesummary') {
+  } else if (toolName === 'getexpensesummary' || toolName === 'getsummary' || toolName === 'expensesummary') {
     let sql = 'SELECT * FROM expenses WHERE 1=1';
     const params = [];
 
-    if (args.category) {
+    if (args.category && args.category.toLowerCase() !== 'all') {
       sql += ' AND LOWER(category) = LOWER(?)';
-      params.push(args.category);
+      params.push(normalizeCategory(args.category));
     }
     if (args.from) {
       sql += ' AND expense_date >= ?';
@@ -116,64 +120,77 @@ export async function executeTool(name, args = {}) {
       .map(([cat, amt]) => `${cat}: ₹${amt}`)
       .join(', ');
 
-    const periodText = args.from || args.to ? 'for the selected period' : 'in total';
+    const periodText = args.category
+      ? `on ${normalizeCategory(args.category)}`
+      : args.from || args.to
+      ? 'for the selected period'
+      : 'in total';
 
-    return {
+    resultOutput = {
       success: true,
       total,
       count: rows.length,
       byCategory,
-      message: `You spent ₹${total.toLocaleString('en-IN')} ${periodText} across ${rows.length} expenses.${categoryBreakdown ? ' Breakdown: ' + categoryBreakdown : ''}`
+      message: `You spent ₹${total.toLocaleString('en-IN')} ${periodText} across ${rows.length} expenses.${categoryBreakdown && !args.category ? ' Breakdown: ' + categoryBreakdown : ''}`
     };
-  }
-
-  if (toolName === 'deleteexpense') {
+  } else if (toolName === 'deleteexpense' || toolName === 'removeexpense' || toolName === 'deletelastexpense') {
     let targetId = args.id;
 
-    if (!targetId || targetId === 'last' || targetId === 'latest') {
+    if (!targetId || String(targetId).toLowerCase() === 'last' || String(targetId).toLowerCase() === 'latest') {
       const lastItem = await get('SELECT * FROM expenses ORDER BY id DESC LIMIT 1');
       if (!lastItem) {
-        return {
+        resultOutput = {
           success: false,
           message: 'No expenses found to delete.'
         };
+      } else {
+        await run('DELETE FROM expenses WHERE id = ?', [lastItem.id]);
+        resultOutput = {
+          success: true,
+          message: `Deleted your last expense: ₹${lastItem.amount} for ${lastItem.description}.`,
+          deletedId: lastItem.id,
+          expense: lastItem
+        };
       }
-      await run('DELETE FROM expenses WHERE id = ?', [lastItem.id]);
-      return {
-        success: true,
-        message: `Deleted your last expense: ₹${lastItem.amount} for ${lastItem.description}.`,
-        deletedId: lastItem.id,
-        expense: lastItem
-      };
+    } else {
+      const parsedId = parseInt(targetId, 10);
+      if (isNaN(parsedId)) {
+        resultOutput = {
+          error: `Invalid expense ID: ${targetId}`
+        };
+      } else {
+        const existing = await get('SELECT * FROM expenses WHERE id = ?', [parsedId]);
+        if (!existing) {
+          resultOutput = {
+            success: false,
+            message: `Could not find expense with ID #${parsedId}.`
+          };
+        } else {
+          await run('DELETE FROM expenses WHERE id = ?', [parsedId]);
+          resultOutput = {
+            success: true,
+            message: `Deleted expense #${parsedId}: ₹${existing.amount} for ${existing.description}.`,
+            deletedId: parsedId,
+            expense: existing
+          };
+        }
+      }
     }
-
-    const parsedId = parseInt(targetId, 10);
-    if (isNaN(parsedId)) {
-      return {
-        error: `Invalid expense ID: ${targetId}`
-      };
-    }
-
-    const existing = await get('SELECT * FROM expenses WHERE id = ?', [parsedId]);
-    if (!existing) {
-      return {
-        success: false,
-        message: `Could not find expense with ID #${parsedId}.`
-      };
-    }
-
-    await run('DELETE FROM expenses WHERE id = ?', [parsedId]);
-    return {
-      success: true,
-      message: `Deleted expense #${parsedId}: ₹${existing.amount} for ${existing.description}.`,
-      deletedId: parsedId,
-      expense: existing
+  } else {
+    resultOutput = {
+      error: `Unknown tool: ${name}`
     };
   }
 
-  return {
-    error: `Unknown tool: ${name}`
-  };
+  if (toolCallId) {
+    executedToolCalls.set(toolCallId, resultOutput);
+    if (executedToolCalls.size > 500) {
+      const firstKey = executedToolCalls.keys().next().value;
+      executedToolCalls.delete(firstKey);
+    }
+  }
+
+  return resultOutput;
 }
 
 /**
@@ -186,22 +203,28 @@ router.post('/tool', async (req, res) => {
     const body = req.body || {};
 
     // 1. Check for Vapi standard "tool-calls" webhook
-    if (body.message && body.message.type === 'tool-calls' && Array.isArray(body.message.toolCalls)) {
+    const toolCallsList =
+      (body.message && Array.isArray(body.message.toolCalls) && body.message.toolCalls) ||
+      (body.message && Array.isArray(body.message.toolCallList) && body.message.toolCallList) ||
+      (Array.isArray(body.toolCalls) && body.toolCalls);
+
+    if (toolCallsList) {
       const results = [];
 
-      for (const call of body.message.toolCalls) {
-        const fn = call.function || {};
-        const fnName = fn.name;
-        let args = fn.arguments;
+      for (const call of toolCallsList) {
+        const fn = call.function || call;
+        const fnName = fn.name || call.name;
+        let args = fn.arguments || fn.parameters || call.arguments || call.parameters || {};
         if (typeof args === 'string') {
           try { args = JSON.parse(args); } catch (e) { args = {}; }
         }
 
-        const output = await executeTool(fnName, args);
-        // Vapi expects a result string or JSON object
+        const output = await executeTool(fnName, args, call.id);
         results.push({
+          name: fnName,
           toolCallId: call.id,
-          result: typeof output.message === 'string' ? output.message : JSON.stringify(output)
+          result: typeof output.message === 'string' ? output.message : JSON.stringify(output),
+          data: output
         });
       }
 
@@ -209,17 +232,18 @@ router.post('/tool', async (req, res) => {
     }
 
     // 2. Check for Vapi legacy "function-call" webhook
-    if (body.message && body.message.type === 'function-call' && body.message.functionCall) {
-      const fn = body.message.functionCall;
-      const fnName = fn.name;
-      let args = fn.parameters || {};
+    const functionCall = (body.message && body.message.functionCall) || body.functionCall;
+    if (functionCall) {
+      const fnName = functionCall.name;
+      let args = functionCall.parameters || functionCall.arguments || {};
       if (typeof args === 'string') {
         try { args = JSON.parse(args); } catch (e) { args = {}; }
       }
 
-      const output = await executeTool(fnName, args);
+      const output = await executeTool(fnName, args, functionCall.id);
       return res.json({
-        result: typeof output.message === 'string' ? output.message : JSON.stringify(output)
+        result: typeof output.message === 'string' ? output.message : JSON.stringify(output),
+        data: output
       });
     }
 
@@ -231,13 +255,15 @@ router.post('/tool', async (req, res) => {
     }
 
     if (toolName) {
-      const output = await executeTool(toolName, toolArgs);
+      const output = await executeTool(toolName, toolArgs, body.toolCallId);
       if (body.toolCallId) {
         return res.json({
           results: [
             {
+              name: toolName,
               toolCallId: body.toolCallId,
-              result: output.message || JSON.stringify(output)
+              result: output.message || JSON.stringify(output),
+              data: output
             }
           ]
         });
@@ -245,7 +271,7 @@ router.post('/tool', async (req, res) => {
       return res.json(output);
     }
 
-    // Fallback: If received ping or unknown message from Vapi
+    // Fallback: If received status-update, speech-update, or end-of-call-report from Vapi Server URL
     res.json({ status: 'ok', received: true });
   } catch (err) {
     console.error('Error handling Vapi tool call:', err);
@@ -258,22 +284,22 @@ router.post('/tool', async (req, res) => {
 
 // Explicit tool endpoints for users configuring individual tool URLs
 router.post('/addExpense', async (req, res) => {
-  const result = await executeTool('addExpense', req.body);
+  const result = await executeTool('addExpense', req.body, req.body?.toolCallId);
   res.json(result);
 });
 
 router.post('/getExpenses', async (req, res) => {
-  const result = await executeTool('getExpenses', req.body);
+  const result = await executeTool('getExpenses', req.body, req.body?.toolCallId);
   res.json(result);
 });
 
 router.post('/getExpenseSummary', async (req, res) => {
-  const result = await executeTool('getExpenseSummary', req.body);
+  const result = await executeTool('getExpenseSummary', req.body, req.body?.toolCallId);
   res.json(result);
 });
 
 router.post('/deleteExpense', async (req, res) => {
-  const result = await executeTool('deleteExpense', req.body);
+  const result = await executeTool('deleteExpense', req.body, req.body?.toolCallId);
   res.json(result);
 });
 

@@ -13,6 +13,205 @@ interface VoiceAssistantProps {
   };
 }
 
+const SYSTEM_PROMPT = `You are VoiceExpense, a helpful voice-first personal expense tracking assistant.
+Your job is to help the user record, query, summarize, and delete their personal expenses.
+
+Always use the provided tools whenever the user asks to add, view, summarize, or delete expenses:
+1. addExpense: Call when the user mentions spending money (e.g. "Add 450 rupees for dinner", "I spent 200 on coffee"). Extract amount (number), category (Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Education, Other), description, and expense_date (YYYY-MM-DD, "today", or "yesterday"). If the amount is missing, ask the user how much they spent before calling addExpense.
+2. getExpenses: Call when the user asks to see recent expenses or filter expenses by category/date.
+3. getExpenseSummary: Call when the user asks how much they spent in total, this month, or on a specific category.
+4. deleteExpense: Call when the user asks to delete their last expense (pass id: "last") or a specific expense ID.
+
+Keep your spoken responses concise, natural, and conversational.
+After recording an expense, confirm the amount, description, and category (for example: "Done. I recorded ₹450 for dinner under Food.").`;
+
+function getToolDefinitions(serverUrl?: string) {
+  const serverBlock = serverUrl ? { server: { url: serverUrl } } : {};
+
+  return [
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'addExpense',
+        description: 'Record a new personal expense with amount, category, description, and date.',
+        parameters: {
+          type: 'object',
+          properties: {
+            amount: {
+              type: 'number',
+              description: 'The expense amount in rupees (must be greater than 0).'
+            },
+            category: {
+              type: 'string',
+              description: 'Expense category: Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Education, or Other.'
+            },
+            description: {
+              type: 'string',
+              description: 'Short description of the expense, e.g., Dinner, Uber ride, Coffee.'
+            },
+            expense_date: {
+              type: 'string',
+              description: 'Date of the expense (today, yesterday, or YYYY-MM-DD).'
+            }
+          },
+          required: ['amount', 'description']
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'getExpenses',
+        description: 'Retrieve recent expenses, optionally filtered by category or date range.',
+        parameters: {
+          type: 'object',
+          properties: {
+            category: {
+              type: 'string',
+              description: 'Optional category to filter by (Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Education, Other).'
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of recent expenses to return (default 5).'
+            },
+            from: {
+              type: 'string',
+              description: 'Optional start date (YYYY-MM-DD).'
+            },
+            to: {
+              type: 'string',
+              description: 'Optional end date (YYYY-MM-DD).'
+            }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'getExpenseSummary',
+        description: 'Calculate total spending and category breakdown, optionally filtered by category or date range.',
+        parameters: {
+          type: 'object',
+          properties: {
+            category: {
+              type: 'string',
+              description: 'Optional category to summarize.'
+            },
+            from: {
+              type: 'string',
+              description: 'Optional start date (YYYY-MM-DD).'
+            },
+            to: {
+              type: 'string',
+              description: 'Optional end date (YYYY-MM-DD).'
+            }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      ...serverBlock,
+      function: {
+        name: 'deleteExpense',
+        description: 'Delete an expense by ID, or pass "last" to delete the most recently added expense.',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: {
+              type: 'string',
+              description: 'The ID of the expense to delete, or "last" for the latest expense.'
+            }
+          },
+          required: ['id']
+        }
+      }
+    }
+  ];
+}
+
+function getPublicWebhookUrl(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const origin = window.location.origin;
+  if (origin.startsWith('https://') && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+    return `${origin}/api/vapi/tool`;
+  }
+  return undefined;
+}
+
+function buildInlineAssistant(serverUrl?: string): any {
+  const assistant: any = {
+    name: 'VoiceExpense Assistant',
+    firstMessage: 'Hi! I am VoiceExpense. Tell me what you spent, or ask for your spending summary.',
+    transcriber: {
+      provider: 'deepgram',
+      model: 'nova-2',
+      language: 'en'
+    },
+    model: {
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: SYSTEM_PROMPT
+        }
+      ],
+      tools: getToolDefinitions(serverUrl)
+    },
+    clientMessages: [
+      'transcript',
+      'hang',
+      'function-call',
+      'speech-update',
+      'metadata',
+      'conversation-update',
+      'tool-calls',
+      'tool-calls-result',
+      'tool.completed'
+    ]
+  };
+
+  if (serverUrl) {
+    assistant.serverUrl = serverUrl;
+    assistant.server = { url: serverUrl };
+  }
+
+  return assistant;
+}
+
+function extractVapiErrorMessage(err: any): string {
+  if (!err) return 'An unknown error occurred during the voice session.';
+  if (typeof err === 'string') return err;
+
+  // Check deeply nested Vapi / Daily / Fetch error structures
+  const nestedMsg =
+    err?.error?.error?.message ||
+    err?.error?.message ||
+    err?.error?.errorMsg ||
+    err?.error?.errorDetail ||
+    err?.errorMsg ||
+    err?.message;
+
+  if (typeof nestedMsg === 'string' && nestedMsg.trim()) {
+    return nestedMsg;
+  }
+
+  if (Array.isArray(nestedMsg)) {
+    return nestedMsg.join(', ');
+  }
+
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return 'Voice assistant connection error.';
+  }
+}
+
 export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   onExpenseMutated,
   onOpenSettings,
@@ -25,7 +224,14 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const [activeSpeechRole, setActiveSpeechRole] = useState<'user' | 'assistant' | null>(null);
 
   const vapiRef = useRef<any>(null);
+  const activeKeyRef = useRef<string>('');
+  const processedToolCallIdsRef = useRef<Set<string>>(new Set());
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const onExpenseMutatedRef = useRef(onExpenseMutated);
+
+  useEffect(() => {
+    onExpenseMutatedRef.current = onExpenseMutated;
+  }, [onExpenseMutated]);
 
   // Auto-scroll transcript container to latest message
   useEffect(() => {
@@ -47,12 +253,39 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     };
   }, []);
 
-  const getVapiInstance = () => {
-    const key = vapiConfig.publicKey || (import.meta as any).env.VITE_VAPI_PUBLIC_KEY || '';
+  // Forward tool calls from browser client to local/deployed backend (deduplicated by toolCallId)
+  const forwardToolCallToBackend = async (messagePayload: any) => {
+    try {
+      const res = await fetch('/api/vapi/tool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: messagePayload })
+      });
+      if (res.ok) {
+        onExpenseMutatedRef.current();
+      }
+    } catch (e) {
+      console.warn('Client-side tool bridge error:', e);
+    }
+  };
+
+  const getVapiInstance = (rawPublicKey: string) => {
+    const key = rawPublicKey.trim();
     if (!key) return null;
+
+    // Recreate Vapi instance if publicKey changed
+    if (vapiRef.current && activeKeyRef.current !== key) {
+      try {
+        vapiRef.current.stop();
+      } catch (e) {
+        // ignore
+      }
+      vapiRef.current = null;
+    }
 
     if (!vapiRef.current) {
       const vapi = new Vapi(key);
+      activeKeyRef.current = key;
 
       vapi.on('call-start', () => {
         setStatus('connected');
@@ -63,8 +296,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         setStatus('disconnected');
         setActiveSpeechRole(null);
         setVolumeLevel(0);
-        // Refresh expenses when call ends in case expenses were added
-        onExpenseMutated();
+        onExpenseMutatedRef.current();
       });
 
       vapi.on('speech-start', () => {
@@ -81,15 +313,16 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       });
 
       vapi.on('message', (message: any) => {
-        // Handle real-time transcripts
+        if (!message) return;
+
+        // 1. Handle real-time transcripts
         if (message.type === 'transcript') {
           const role = message.role === 'user' ? 'user' : 'assistant';
           const text = message.transcript || message.text || '';
-          
+
           if (text.trim()) {
             setActiveSpeechRole(role);
             setTranscripts((prev) => {
-              // If last message was same role and not final, update it
               const last = prev[prev.length - 1];
               if (last && last.role === role && !last.isFinal && message.transcriptType === 'partial') {
                 return [
@@ -97,7 +330,6 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
                   { ...last, text, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
                 ];
               }
-              // If final, replace or append
               if (last && last.role === role && !last.isFinal) {
                 return [
                   ...prev.slice(0, -1),
@@ -118,24 +350,51 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           }
         }
 
-        // Handle tool calls or function execution events
-        if (
-          message.type === 'tool-calls' ||
-          message.type === 'function-call' ||
-          message.type === 'tool-call-result'
+        // 2. Handle tool calls / function calls and ensure backend state is synced
+        if (message.type === 'tool-calls' || message.type === 'function-call') {
+          const calls = message.toolCalls || message.toolCallList || (message.functionCall ? [message.functionCall] : []);
+          let hasNewCall = false;
+          for (const c of calls) {
+            const id = c?.id || `${c?.name || c?.function?.name}-${JSON.stringify(c?.arguments || c?.parameters || {})}`;
+            if (!processedToolCallIdsRef.current.has(id)) {
+              processedToolCallIdsRef.current.add(id);
+              hasNewCall = true;
+            }
+          }
+          if (hasNewCall) {
+            forwardToolCallToBackend(message);
+          } else {
+            onExpenseMutatedRef.current();
+          }
+        } else if (
+          message.type === 'tool-call-result' ||
+          message.type === 'tool-calls-result' ||
+          message.type === 'tool.completed'
         ) {
-          // Immediately trigger dashboard data refresh!
-          onExpenseMutated();
+          onExpenseMutatedRef.current();
         }
       });
 
       vapi.on('error', (err: any) => {
+        // Ignore non-critical audio processor warnings from Daily/Krisp
+        if (
+          err?.type === 'audio-processing-setup-error' ||
+          err?.type === 'audio-processor-recovery-error' ||
+          err?.type === 'local-audio-level-observer-error'
+        ) {
+          console.warn('Non-critical Vapi audio processor warning:', err);
+          return;
+        }
+
         console.error('Vapi error:', err);
-        const errMsg = err?.message || err?.errorMsg || 'An error occurred during the voice call.';
-        if (errMsg.includes('Permission') || errMsg.includes('NotAllowedError')) {
-          setErrorMessage('Microphone permission is required. Please allow microphone access in your browser.');
-        } else if (errMsg.includes('401') || errMsg.includes('auth') || errMsg.includes('key')) {
-          setErrorMessage('Invalid Vapi Public Key. Please check your credentials in settings.');
+        const errMsg = extractVapiErrorMessage(err);
+
+        if (/permission|notallowederror|microphone|device/i.test(errMsg)) {
+          setErrorMessage('Microphone permission is required. Please allow microphone access in your browser settings.');
+        } else if (/401|unauthorized|public key|invalid key|authentication/i.test(errMsg)) {
+          setErrorMessage('Invalid Vapi Public Key. Please verify your Public Key in Vapi Settings.');
+        } else if (/assistantId|assistant.*not found|404/i.test(errMsg)) {
+          setErrorMessage('Assistant ID not found in your Vapi account. Tip: Clear the Assistant ID in Vapi Settings to use the built-in auto-configured VoiceExpense assistant.');
         } else {
           setErrorMessage(errMsg);
         }
@@ -144,6 +403,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
       vapiRef.current = vapi;
     }
+
     return vapiRef.current;
   };
 
@@ -153,7 +413,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     if (status !== 'disconnected') {
       try {
         if (vapiRef.current) {
-          vapiRef.current.stop();
+          await vapiRef.current.stop();
         }
       } catch (e) {
         console.error('Error stopping call:', e);
@@ -162,31 +422,87 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       return;
     }
 
-    const publicKey = vapiConfig.publicKey || (import.meta as any).env.VITE_VAPI_PUBLIC_KEY;
-    const assistantId = vapiConfig.assistantId || (import.meta as any).env.VITE_VAPI_ASSISTANT_ID;
+    const publicKey = (vapiConfig.publicKey || (import.meta as any).env.VITE_VAPI_PUBLIC_KEY || '').trim();
+    const assistantId = (vapiConfig.assistantId || (import.meta as any).env.VITE_VAPI_ASSISTANT_ID || '').trim();
 
-    if (!publicKey || !assistantId) {
-      setErrorMessage('Vapi Public Key and Assistant ID are required to start voice interaction.');
+    if (!publicKey) {
+      setErrorMessage('Vapi Public Key is required to start voice interaction. Click "Vapi Settings" to enter your key.');
       onOpenSettings();
       return;
     }
 
     try {
       setStatus('connecting');
-      const vapi = getVapiInstance();
+
+      // Request microphone permission upfront to give a clear error if blocked
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach((t) => t.stop());
+        } catch (micErr: any) {
+          setErrorMessage('Microphone access was denied. Please allow microphone access in your browser address bar and try again.');
+          setStatus('disconnected');
+          return;
+        }
+      }
+
+      const vapi = getVapiInstance(publicKey);
       if (!vapi) {
-        setErrorMessage('Failed to initialize Vapi client. Please verify credentials.');
+        setErrorMessage('Failed to initialize Vapi client. Please check your Public Key.');
         setStatus('disconnected');
         return;
       }
 
-      await vapi.start(assistantId);
+      const serverUrl = getPublicWebhookUrl();
+      let callResult = null;
+
+      if (assistantId) {
+        // Try starting with user's Assistant ID + serverUrl override so Vercel deployment works automatically
+        const overrides: any = {
+          clientMessages: [
+            'transcript',
+            'hang',
+            'function-call',
+            'speech-update',
+            'metadata',
+            'conversation-update',
+            'tool-calls',
+            'tool-calls-result',
+            'tool.completed'
+          ]
+        };
+        if (serverUrl) {
+          overrides.serverUrl = serverUrl;
+          overrides.server = { url: serverUrl };
+        }
+
+        callResult = await vapi.start(assistantId, overrides);
+
+        // If starting with assistantId failed (e.g. invalid assistantId), fallback to inline assistant config
+        if (!callResult) {
+          console.warn('Starting with assistantId returned null; falling back to inline VoiceExpense assistant.');
+          try {
+            await vapi.stop();
+          } catch {}
+          setStatus('connecting');
+          setErrorMessage(null);
+          callResult = await vapi.start(buildInlineAssistant(serverUrl));
+        }
+      } else {
+        // Start with built-in auto-configured VoiceExpense assistant
+        callResult = await vapi.start(buildInlineAssistant(serverUrl));
+      }
+
+      if (!callResult) {
+        setStatus('disconnected');
+      }
     } catch (err: any) {
       console.error('Failed to start Vapi call:', err);
-      if (err.name === 'NotAllowedError' || err.message?.includes('Permission')) {
+      const msg = extractVapiErrorMessage(err);
+      if (/permission|notallowederror/i.test(msg)) {
         setErrorMessage('Microphone permission is required.');
       } else {
-        setErrorMessage(err.message || 'Unable to start voice session. Check your Vapi credentials.');
+        setErrorMessage(msg || 'Unable to start voice session. Check your Vapi Public Key.');
       }
       setStatus('disconnected');
     }
@@ -253,9 +569,9 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             <p className="font-semibold">{errorMessage}</p>
             <button
               onClick={onOpenSettings}
-              className="mt-1.5 text-xs font-medium underline text-red-300 hover:text-white"
+              className="mt-1.5 text-xs font-medium underline text-red-300 hover:text-white cursor-pointer"
             >
-              Open Settings to verify Public Key & Assistant ID &rarr;
+              Open Vapi Settings to check Public Key &amp; Assistant ID &rarr;
             </button>
           </div>
         </div>
