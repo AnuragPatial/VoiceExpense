@@ -1,4 +1,5 @@
 import initSqlJs from 'sql.js';
+import initSqlJsAsm from 'sql.js/dist/sql-asm.js';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -76,7 +77,9 @@ export async function getDatabase() {
   if (dbInstance) return dbInstance;
 
   const wasmBinary = findWasmBinary();
-  const SQL = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
+  const SQL = wasmBinary
+    ? await initSqlJs({ wasmBinary })
+    : await initSqlJsAsm();
 
   if (fs.existsSync(dbPath)) {
     try {

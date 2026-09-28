@@ -1,6 +1,4 @@
 {
-  "version": 2,
-  "includeFiles": "node_modules/sql.js/dist/sql-wasm.wasm",
   "rewrites": [
     {
       "source": "/api/(.*)",
@@ -12,3 +10,4 @@
     }
   ]
 }
+
