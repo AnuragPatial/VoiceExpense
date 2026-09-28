@@ -162,7 +162,7 @@ function buildInlineAssistant(serverUrl?: string): any {
     },
     model: {
       provider: 'openai',
-      model: 'gpt-4o-mini',
+      model: 'gpt-5.6-sol',
       messages: [
         {
           role: 'system',
@@ -178,15 +178,10 @@ function buildInlineAssistant(serverUrl?: string): any {
       'speech-update',
       'metadata',
       'conversation-update',
+      'status-update',
       'tool-calls',
       'tool-calls-result',
       'tool.completed'
-    ],
-    serverMessages: [
-      'tool-calls',
-      'function-call',
-      'status-update',
-      'end-of-call-report'
     ]
   };
 
@@ -201,21 +196,26 @@ function extractVapiErrorMessage(err: any): string {
   if (!err) return 'An unknown error occurred during the voice session.';
   if (typeof err === 'string') return err;
 
-  // Check deeply nested Vapi / Daily / Fetch error structures
-  const nestedMsg =
-    err?.error?.error?.message ||
-    err?.error?.message ||
-    err?.error?.errorMsg ||
-    err?.error?.errorDetail ||
-    err?.errorMsg ||
-    err?.message;
+  // Check deeply nested Vapi / Daily / Fetch error structures (only pick strings/arrays, not nested objects)
+  const candidates = [
+    err?.error?.errorMsg,
+    err?.error?.error?.msg,
+    err?.error?.error?.message,
+    err?.error?.message?.msg,
+    err?.error?.message?.message,
+    err?.error?.message,
+    err?.error?.errorDetail,
+    err?.errorMsg,
+    err?.message
+  ];
 
-  if (typeof nestedMsg === 'string' && nestedMsg.trim()) {
-    return nestedMsg;
-  }
-
-  if (Array.isArray(nestedMsg)) {
-    return nestedMsg.join(', ');
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+    if (Array.isArray(candidate) && candidate.length > 0) {
+      return candidate.map((c) => (typeof c === 'string' ? c : JSON.stringify(c))).join(', ');
+    }
   }
 
   try {
@@ -223,6 +223,18 @@ function extractVapiErrorMessage(err: any): string {
   } catch {
     return 'Voice assistant connection error.';
   }
+}
+
+function isDailyMeetingEndedEvent(err: any): boolean {
+  if (!err) return false;
+  const type = err?.error?.error?.type || err?.error?.message?.type || err?.error?.type;
+  const msg = extractVapiErrorMessage(err).toLowerCase();
+  return (
+    type === 'ejected' ||
+    msg.includes('meeting has ended') ||
+    msg.includes('meeting ended') ||
+    msg.includes('call has ended')
+  );
 }
 
 export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
@@ -241,6 +253,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const processedToolCallIdsRef = useRef<Set<string>>(new Set());
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const onExpenseMutatedRef = useRef(onExpenseMutated);
+  const callStartTimeRef = useRef<number>(0);
+  const hasSpokenRef = useRef<boolean>(false);
+  const usingAssistantIdRef = useRef<boolean>(false);
+  const fallbackTriggeredRef = useRef<boolean>(false);
 
   useEffect(() => {
     onExpenseMutatedRef.current = onExpenseMutated;
@@ -317,6 +333,9 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       });
 
       vapi.on('call-end', () => {
+        if (fallbackTriggeredRef.current && !hasSpokenRef.current && Date.now() - callStartTimeRef.current < 8000) {
+          return;
+        }
         setStatus('disconnected');
         setActiveSpeechRole(null);
         setVolumeLevel(0);
@@ -324,6 +343,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       });
 
       vapi.on('speech-start', () => {
+        hasSpokenRef.current = true;
         setStatus('listening');
       });
 
@@ -345,6 +365,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           const text = message.transcript || message.text || '';
 
           if (text.trim()) {
+            hasSpokenRef.current = true;
             setActiveSpeechRole(role);
             setTranscripts((prev) => {
               const last = prev[prev.length - 1];
@@ -416,6 +437,43 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           return;
         }
 
+        // Handle Daily "Meeting has ended" / "ejected" event cleanly
+        if (isDailyMeetingEndedEvent(err)) {
+          const elapsed = Date.now() - callStartTimeRef.current;
+          if (usingAssistantIdRef.current && !hasSpokenRef.current && !fallbackTriggeredRef.current && elapsed < 8000) {
+            console.warn('Assistant ID session ended before speech; falling back to inline VoiceExpense assistant.');
+            fallbackTriggeredRef.current = true;
+            usingAssistantIdRef.current = false;
+            setStatus('connecting');
+            setErrorMessage(null);
+            const serverUrl = getPublicWebhookUrl();
+            setTimeout(async () => {
+              try {
+                try {
+                  await vapi.stop();
+                } catch {}
+                callStartTimeRef.current = Date.now();
+                const res = await vapi.start(buildInlineAssistant(serverUrl));
+                if (!res) {
+                  setStatus('disconnected');
+                }
+              } catch (fallbackErr) {
+                console.error('Fallback inline assistant failed:', fallbackErr);
+                setErrorMessage(extractVapiErrorMessage(fallbackErr));
+                setStatus('disconnected');
+              }
+            }, 300);
+            return;
+          }
+
+          // Normal end of meeting from Vapi server
+          setStatus('disconnected');
+          setActiveSpeechRole(null);
+          setVolumeLevel(0);
+          onExpenseMutatedRef.current();
+          return;
+        }
+
         console.error('Vapi error:', err);
         const errMsg = extractVapiErrorMessage(err);
 
@@ -441,6 +499,8 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     setErrorMessage(null);
 
     if (status !== 'disconnected') {
+      fallbackTriggeredRef.current = false;
+      usingAssistantIdRef.current = false;
       try {
         if (vapiRef.current) {
           await vapiRef.current.stop();
@@ -463,6 +523,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
     try {
       setStatus('connecting');
+      callStartTimeRef.current = Date.now();
+      hasSpokenRef.current = false;
+      fallbackTriggeredRef.current = false;
+      usingAssistantIdRef.current = Boolean(assistantId);
 
       // Request microphone permission upfront to give a clear error if blocked
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
@@ -487,9 +551,19 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       let callResult = null;
 
       if (assistantId) {
-        // Attach the 4 expense tools via tools:append and set server.url so user's Vapi Dashboard Assistant always has tools available
+        // Override model tools and server URL using standard Vapi AssistantOverrides schema
         const overrides: any = {
-          'tools:append': getToolDefinitions(serverUrl),
+          model: {
+            provider: 'openai',
+            model: 'gpt-5.6-sol',
+            messages: [
+              {
+                role: 'system',
+                content: SYSTEM_PROMPT
+              }
+            ],
+            tools: getToolDefinitions(serverUrl)
+          },
           clientMessages: [
             'transcript',
             'hang',
@@ -497,15 +571,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             'speech-update',
             'metadata',
             'conversation-update',
+            'status-update',
             'tool-calls',
             'tool-calls-result',
             'tool.completed'
-          ],
-          serverMessages: [
-            'tool-calls',
-            'function-call',
-            'status-update',
-            'end-of-call-report'
           ]
         };
         if (serverUrl) {
@@ -519,13 +588,15 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           callResult = null;
         }
 
-        // If starting with assistantId failed, fallback to inline assistant config
+        // If starting with assistantId failed immediately, fallback to inline assistant config
         if (!callResult) {
+          usingAssistantIdRef.current = false;
           try {
             await vapi.stop();
           } catch {}
           setStatus('connecting');
           setErrorMessage(null);
+          callStartTimeRef.current = Date.now();
           callResult = await vapi.start(buildInlineAssistant(serverUrl));
         }
       } else {

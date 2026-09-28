@@ -116,7 +116,7 @@ function buildInlineAssistant(serverUrl) {
     },
     model: {
       provider: 'openai',
-      model: 'gpt-4o-mini',
+      model: 'gpt-5.6-sol',
       messages: [{ role: 'system', content: SYSTEM_PROMPT }],
       tools: getToolDefinitions(serverUrl)
     },
@@ -127,15 +127,10 @@ function buildInlineAssistant(serverUrl) {
       'speech-update',
       'metadata',
       'conversation-update',
+      'status-update',
       'tool-calls',
       'tool-calls-result',
       'tool.completed'
-    ],
-    serverMessages: [
-      'tool-calls',
-      'function-call',
-      'status-update',
-      'end-of-call-report'
     ]
   };
 
@@ -150,20 +145,25 @@ function extractVapiErrorMessage(err) {
   if (!err) return 'An unknown error occurred during the voice session.';
   if (typeof err === 'string') return err;
 
-  const nestedMsg =
-    err?.error?.error?.message ||
-    err?.error?.message ||
-    err?.error?.errorMsg ||
-    err?.error?.errorDetail ||
-    err?.errorMsg ||
-    err?.message;
+  const candidates = [
+    err?.error?.errorMsg,
+    err?.error?.error?.msg,
+    err?.error?.error?.message,
+    err?.error?.message?.msg,
+    err?.error?.message?.message,
+    err?.error?.message,
+    err?.error?.errorDetail,
+    err?.errorMsg,
+    err?.message
+  ];
 
-  if (typeof nestedMsg === 'string' && nestedMsg.trim()) {
-    return nestedMsg;
-  }
-
-  if (Array.isArray(nestedMsg)) {
-    return nestedMsg.join(', ');
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+    if (Array.isArray(candidate) && candidate.length > 0) {
+      return candidate.map((c) => (typeof c === 'string' ? c : JSON.stringify(c))).join(', ');
+    }
   }
 
   try {
@@ -171,6 +171,18 @@ function extractVapiErrorMessage(err) {
   } catch {
     return 'Voice assistant connection error.';
   }
+}
+
+function isDailyMeetingEndedEvent(err) {
+  if (!err) return false;
+  const type = err?.error?.error?.type || err?.error?.message?.type || err?.error?.type;
+  const msg = extractVapiErrorMessage(err).toLowerCase();
+  return (
+    type === 'ejected' ||
+    msg.includes('meeting has ended') ||
+    msg.includes('meeting ended') ||
+    msg.includes('call has ended')
+  );
 }
 
 export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig }) => {
@@ -185,6 +197,10 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
   const processedToolCallIdsRef = useRef(new Set());
   const transcriptEndRef = useRef(null);
   const onExpenseMutatedRef = useRef(onExpenseMutated);
+  const callStartTimeRef = useRef(0);
+  const hasSpokenRef = useRef(false);
+  const usingAssistantIdRef = useRef(false);
+  const fallbackTriggeredRef = useRef(false);
 
   useEffect(() => {
     onExpenseMutatedRef.current = onExpenseMutated;
@@ -253,6 +269,9 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
       });
 
       vapi.on('call-end', () => {
+        if (fallbackTriggeredRef.current && !hasSpokenRef.current && Date.now() - callStartTimeRef.current < 8000) {
+          return;
+        }
         setStatus('disconnected');
         setActiveSpeechRole(null);
         setVolumeLevel(0);
@@ -260,6 +279,7 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
       });
 
       vapi.on('speech-start', () => {
+        hasSpokenRef.current = true;
         setStatus('listening');
       });
 
@@ -280,6 +300,7 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
           const text = message.transcript || message.text || '';
 
           if (text.trim()) {
+            hasSpokenRef.current = true;
             setActiveSpeechRole(role);
             setTranscripts((prev) => {
               const last = prev[prev.length - 1];
@@ -348,6 +369,35 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
           return;
         }
 
+        if (isDailyMeetingEndedEvent(err)) {
+          const elapsed = Date.now() - callStartTimeRef.current;
+          if (usingAssistantIdRef.current && !hasSpokenRef.current && !fallbackTriggeredRef.current && elapsed < 8000) {
+            fallbackTriggeredRef.current = true;
+            usingAssistantIdRef.current = false;
+            setStatus('connecting');
+            setErrorMessage(null);
+            const serverUrl = getPublicWebhookUrl();
+            setTimeout(async () => {
+              try {
+                try { await vapi.stop(); } catch {}
+                callStartTimeRef.current = Date.now();
+                const res = await vapi.start(buildInlineAssistant(serverUrl));
+                if (!res) setStatus('disconnected');
+              } catch (fallbackErr) {
+                setErrorMessage(extractVapiErrorMessage(fallbackErr));
+                setStatus('disconnected');
+              }
+            }, 300);
+            return;
+          }
+
+          setStatus('disconnected');
+          setActiveSpeechRole(null);
+          setVolumeLevel(0);
+          onExpenseMutatedRef.current();
+          return;
+        }
+
         console.error('Vapi error:', err);
         const errMsg = extractVapiErrorMessage(err);
         if (/permission|notallowederror|microphone/i.test(errMsg)) {
@@ -367,6 +417,8 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
     setErrorMessage(null);
 
     if (status !== 'disconnected') {
+      fallbackTriggeredRef.current = false;
+      usingAssistantIdRef.current = false;
       try {
         if (vapiRef.current) await vapiRef.current.stop();
       } catch (e) {}
@@ -385,6 +437,11 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
 
     try {
       setStatus('connecting');
+      callStartTimeRef.current = Date.now();
+      hasSpokenRef.current = false;
+      fallbackTriggeredRef.current = false;
+      usingAssistantIdRef.current = Boolean(assistantId);
+
       const vapi = getVapiInstance(publicKey);
       if (!vapi) {
         setErrorMessage('Failed to initialize Vapi client. Please verify credentials.');
@@ -397,7 +454,12 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
 
       if (assistantId) {
         const overrides = {
-          'tools:append': getToolDefinitions(serverUrl),
+          model: {
+            provider: 'openai',
+            model: 'gpt-5.6-sol',
+            messages: [{ role: 'system', content: SYSTEM_PROMPT }],
+            tools: getToolDefinitions(serverUrl)
+          },
           clientMessages: [
             'transcript',
             'hang',
@@ -405,15 +467,10 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
             'speech-update',
             'metadata',
             'conversation-update',
+            'status-update',
             'tool-calls',
             'tool-calls-result',
             'tool.completed'
-          ],
-          serverMessages: [
-            'tool-calls',
-            'function-call',
-            'status-update',
-            'end-of-call-report'
           ]
         };
         if (serverUrl) {
@@ -425,9 +482,11 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
           callResult = null;
         }
         if (!callResult) {
+          usingAssistantIdRef.current = false;
           try { await vapi.stop(); } catch {}
           setStatus('connecting');
           setErrorMessage(null);
+          callStartTimeRef.current = Date.now();
           callResult = await vapi.start(buildInlineAssistant(serverUrl));
         }
       } else {
