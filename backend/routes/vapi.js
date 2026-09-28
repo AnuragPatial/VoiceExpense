@@ -204,27 +204,32 @@ router.post('/tool', async (req, res) => {
 
     // 1. Check for Vapi standard "tool-calls" webhook
     const toolCallsList =
-      (body.message && Array.isArray(body.message.toolCalls) && body.message.toolCalls) ||
       (body.message && Array.isArray(body.message.toolCallList) && body.message.toolCallList) ||
+      (body.message && Array.isArray(body.message.toolCalls) && body.message.toolCalls) ||
+      (body.message &&
+        Array.isArray(body.message.toolWithToolCallList) &&
+        body.message.toolWithToolCallList.map(t => t.toolCall || t)) ||
+      (Array.isArray(body.toolCallList) && body.toolCallList) ||
       (Array.isArray(body.toolCalls) && body.toolCalls);
 
     if (toolCallsList) {
       const results = [];
 
-      for (const call of toolCallsList) {
-        const fn = call.function || call;
-        const fnName = fn.name || call.name;
+      for (const item of toolCallsList) {
+        const call = item.toolCall || item;
+        const fn = call.function || item.function || call;
+        const fnName = fn.name || call.name || item.name;
+        const toolCallId = call.id || item.id;
         let args = fn.arguments || fn.parameters || call.arguments || call.parameters || {};
         if (typeof args === 'string') {
           try { args = JSON.parse(args); } catch (e) { args = {}; }
         }
 
-        const output = await executeTool(fnName, args, call.id);
+        const output = await executeTool(fnName, args, toolCallId);
         results.push({
           name: fnName,
-          toolCallId: call.id,
-          result: typeof output.message === 'string' ? output.message : JSON.stringify(output),
-          data: output
+          toolCallId,
+          result: typeof output.message === 'string' ? output.message : JSON.stringify(output)
         });
       }
 

@@ -134,13 +134,21 @@ function getToolDefinitions(serverUrl?: string) {
   ];
 }
 
-function getPublicWebhookUrl(): string | undefined {
-  if (typeof window === 'undefined') return undefined;
+const DEFAULT_PUBLIC_WEBHOOK_URL = 'https://voice-expense-swart.vercel.app/api/vapi/tool';
+
+function getPublicWebhookUrl(): string {
+  if (typeof window === 'undefined') return DEFAULT_PUBLIC_WEBHOOK_URL;
   const origin = window.location.origin;
-  if (origin.startsWith('https://') && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+  const isPrivateOrLocal =
+    !origin.startsWith('https://') ||
+    origin.includes('localhost') ||
+    origin.includes('127.0.0.1') ||
+    origin.includes('.run.app');
+
+  if (!isPrivateOrLocal) {
     return `${origin}/api/vapi/tool`;
   }
-  return undefined;
+  return DEFAULT_PUBLIC_WEBHOOK_URL;
 }
 
 function buildInlineAssistant(serverUrl?: string): any {
@@ -173,11 +181,16 @@ function buildInlineAssistant(serverUrl?: string): any {
       'tool-calls',
       'tool-calls-result',
       'tool.completed'
+    ],
+    serverMessages: [
+      'tool-calls',
+      'function-call',
+      'status-update',
+      'end-of-call-report'
     ]
   };
 
   if (serverUrl) {
-    assistant.serverUrl = serverUrl;
     assistant.server = { url: serverUrl };
   }
 
@@ -363,7 +376,13 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
         // 2. Handle tool calls / function calls and ensure backend state is synced
         if (message.type === 'tool-calls' || message.type === 'function-call') {
-          const calls = message.toolCalls || message.toolCallList || (message.functionCall ? [message.functionCall] : []);
+          const calls =
+            message.toolCallList ||
+            message.toolCalls ||
+            (Array.isArray(message.toolWithToolCallList)
+              ? message.toolWithToolCallList.map((t: any) => t.toolCall || t)
+              : null) ||
+            (message.functionCall ? [message.functionCall] : []);
           let hasNewCall = false;
           for (const c of calls) {
             const id = c?.id || `${c?.name || c?.function?.name}-${JSON.stringify(c?.arguments || c?.parameters || {})}`;
@@ -468,8 +487,9 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       let callResult = null;
 
       if (assistantId) {
-        // Try starting with user's Assistant ID + serverUrl override so Vercel deployment works automatically
+        // Attach the 4 expense tools via tools:append and set server.url so user's Vapi Dashboard Assistant always has tools available
         const overrides: any = {
+          'tools:append': getToolDefinitions(serverUrl),
           clientMessages: [
             'transcript',
             'hang',
@@ -480,18 +500,27 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             'tool-calls',
             'tool-calls-result',
             'tool.completed'
+          ],
+          serverMessages: [
+            'tool-calls',
+            'function-call',
+            'status-update',
+            'end-of-call-report'
           ]
         };
         if (serverUrl) {
-          overrides.serverUrl = serverUrl;
           overrides.server = { url: serverUrl };
         }
 
-        callResult = await vapi.start(assistantId, overrides);
+        try {
+          callResult = await vapi.start(assistantId, overrides);
+        } catch (assistantErr) {
+          console.warn('Starting with assistantId failed; falling back to inline assistant:', assistantErr);
+          callResult = null;
+        }
 
-        // If starting with assistantId failed (e.g. invalid assistantId), fallback to inline assistant config
+        // If starting with assistantId failed, fallback to inline assistant config
         if (!callResult) {
-          console.warn('Starting with assistantId returned null; falling back to inline VoiceExpense assistant.');
           try {
             await vapi.stop();
           } catch {}

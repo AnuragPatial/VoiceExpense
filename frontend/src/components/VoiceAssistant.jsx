@@ -88,13 +88,21 @@ function getToolDefinitions(serverUrl) {
   ];
 }
 
+const DEFAULT_PUBLIC_WEBHOOK_URL = 'https://voice-expense-swart.vercel.app/api/vapi/tool';
+
 function getPublicWebhookUrl() {
-  if (typeof window === 'undefined') return undefined;
+  if (typeof window === 'undefined') return DEFAULT_PUBLIC_WEBHOOK_URL;
   const origin = window.location.origin;
-  if (origin.startsWith('https://') && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+  const isPrivateOrLocal =
+    !origin.startsWith('https://') ||
+    origin.includes('localhost') ||
+    origin.includes('127.0.0.1') ||
+    origin.includes('.run.app');
+
+  if (!isPrivateOrLocal) {
     return `${origin}/api/vapi/tool`;
   }
-  return undefined;
+  return DEFAULT_PUBLIC_WEBHOOK_URL;
 }
 
 function buildInlineAssistant(serverUrl) {
@@ -122,11 +130,16 @@ function buildInlineAssistant(serverUrl) {
       'tool-calls',
       'tool-calls-result',
       'tool.completed'
+    ],
+    serverMessages: [
+      'tool-calls',
+      'function-call',
+      'status-update',
+      'end-of-call-report'
     ]
   };
 
   if (serverUrl) {
-    assistant.serverUrl = serverUrl;
     assistant.server = { url: serverUrl };
   }
 
@@ -297,7 +310,13 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
         }
 
         if (message.type === 'tool-calls' || message.type === 'function-call') {
-          const calls = message.toolCalls || message.toolCallList || (message.functionCall ? [message.functionCall] : []);
+          const calls =
+            message.toolCallList ||
+            message.toolCalls ||
+            (Array.isArray(message.toolWithToolCallList)
+              ? message.toolWithToolCallList.map((t) => t.toolCall || t)
+              : null) ||
+            (message.functionCall ? [message.functionCall] : []);
           let hasNewCall = false;
           for (const c of calls) {
             const id = c?.id || `${c?.name || c?.function?.name}-${JSON.stringify(c?.arguments || c?.parameters || {})}`;
@@ -378,6 +397,7 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
 
       if (assistantId) {
         const overrides = {
+          'tools:append': getToolDefinitions(serverUrl),
           clientMessages: [
             'transcript',
             'hang',
@@ -388,13 +408,22 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
             'tool-calls',
             'tool-calls-result',
             'tool.completed'
+          ],
+          serverMessages: [
+            'tool-calls',
+            'function-call',
+            'status-update',
+            'end-of-call-report'
           ]
         };
         if (serverUrl) {
-          overrides.serverUrl = serverUrl;
           overrides.server = { url: serverUrl };
         }
-        callResult = await vapi.start(assistantId, overrides);
+        try {
+          callResult = await vapi.start(assistantId, overrides);
+        } catch (assistantErr) {
+          callResult = null;
+        }
         if (!callResult) {
           try { await vapi.stop(); } catch {}
           setStatus('connecting');
