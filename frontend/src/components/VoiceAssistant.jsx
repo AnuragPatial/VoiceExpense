@@ -220,7 +220,18 @@ export const VoiceAssistant = ({ onExpenseMutated, onOpenSettings, vapiConfig })
     }
 
     if (!vapiRef.current) {
-      const vapi = new Vapi(key);
+      const VapiConstructor =
+        typeof Vapi === 'function'
+          ? Vapi
+          : typeof Vapi?.default === 'function'
+          ? Vapi.default
+          : Vapi?.default?.default;
+
+      if (typeof VapiConstructor !== 'function') {
+        throw new Error('Failed to initialize Vapi SDK constructor.');
+      }
+
+      const vapi = new VapiConstructor(key);
       activeKeyRef.current = key;
 
       vapi.on('call-start', () => {
